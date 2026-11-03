@@ -257,7 +257,7 @@ def decode_a_record(rdata):
     return socket.inet_ntoa(rdata)
 
 
-def interpret_dns_record(record):
+def interpret_dns_record(record, message=None):
 
     if record["type"] == 1 and record["class"] == 1:
 
@@ -268,6 +268,24 @@ def interpret_dns_record(record):
             "type": "A",
             "ttl": record["ttl"],
             "value": ip_address
+        }
+
+    # CNAME record
+    if record["type"] == 5 and record["class"] == 1:
+
+        if message is None:
+            raise ValueError("Original DNS message is required to decode CNAME.")
+
+        canonical_name, _ = decode_domain_name(
+            message,
+            record["rdata_offset"]
+        )
+
+        return {
+            "name": record["name"],
+            "type": "CNAME",
+            "ttl": record["ttl"],
+            "value": canonical_name
         }
 
     return None
@@ -290,7 +308,7 @@ def parse_answer_section(message, offset, ancount):
 
         if record["type"] == 1 and record["class"] == 1:
 
-            result = interpret_dns_record(record)
+            result = interpret_dns_record(record, message)
 
             answers.append(result)
 
@@ -347,7 +365,7 @@ def parse_additional_section(message, offset, arcount):
         # Extract only A records
         if record["type"] == 1 and record["class"] == 1:
 
-            result = interpret_dns_record(record)
+            result = interpret_dns_record(record, message)
 
             additional_records.append(result)
 

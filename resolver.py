@@ -194,10 +194,13 @@ def resolve_nameserver_ip(
 # 6. Main iterative resolution function
 # --------------------------------------------------
 
-def resolve_test(domain, resolving_nameservers=None, depth=0):
+def resolve_test(domain, resolving_nameservers=None, depth=0, cname_chain=None):
 
     if resolving_nameservers is None:
         resolving_nameservers = set()
+
+    if cname_chain is None:
+        cname_chain = set()
 
     domain_key = domain.rstrip(".").lower()
 
@@ -206,14 +209,23 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
         print("Circular nameserver lookup detected:", domain)
         return None
 
+    # Prevent CNAME loops.
+    if domain_key in cname_chain:
+        print("CNAME loop detected:", domain)
+        return None
+
     # Limit recursive nameserver lookups.
     if depth >= 10:
         print("Maximum lookup depth reached.")
         return None
 
-    # Track domains currently being resolved.
+    # Track nameserver lookups independently.
     resolving_nameservers = set(resolving_nameservers)
     resolving_nameservers.add(domain_key)
+
+    # Track CNAME lookups independently.
+    cname_chain = set(cname_chain)
+    cname_chain.add(domain_key)
 
     # Start with the root server.
     current_referrals = [
@@ -288,19 +300,60 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
                 print("Trying next nameserver.")
                 continue
 
-            # Final A record found.
-            if result["answers"]:
+            # Check for A records first.
+            a_records = [
+                answer
+                for answer in result["answers"]
+                if answer["type"] == "A"
+            ]
+
+            if a_records:
 
                 print("\nFinal A records:")
 
-                for answer in result["answers"]:
+                for answer in a_records:
                     print(
                         answer["name"],
                         "->",
                         answer["value"]
                     )
 
-                return result["answers"]
+                return a_records
+
+            # Check for CNAME records.
+            cname_records = [
+                answer
+                for answer in result["answers"]
+                if answer["type"] == "CNAME"
+            ]
+
+            if cname_records:
+
+                cname_record = next(
+                    (
+                        answer for answer in cname_records
+                        if answer["name"].rstrip(".").lower()
+                        == domain_key
+                    ),
+                    None
+                )
+
+                if cname_record is not None:
+
+                    cname_target = cname_record["value"]
+
+                    print("\nCNAME record found!")
+                    print("Alias:", domain)
+                    print("Canonical name:", cname_target)
+
+                    print("\nResolving CNAME target...")
+
+                    return resolve_test(
+                        cname_target,
+                        resolving_nameservers=set(),
+                        depth=0,
+                        cname_chain=cname_chain
+                    )
 
             # Extract the next referral.
             referrals = process_referral(

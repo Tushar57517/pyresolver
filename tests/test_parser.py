@@ -3,8 +3,10 @@ import struct
 
 from dns_message import (
     parse_dns_resource_record,
-    decode_domain_name
+    decode_domain_name,
+    interpret_dns_record
 )
+from resolver import resolve_test
 
 
 class TestDNSParserSafety(unittest.TestCase):
@@ -50,6 +52,40 @@ class TestDNSParserSafety(unittest.TestCase):
         with self.assertRaises(ValueError):
             decode_domain_name(message, 0)
 
+    def test_cname_record_decoding(self):
+        # Original DNS message containing "example.com"
+        message = (
+            b"\x07example\x03com\x00"
+        )
+
+        record = {
+            "name": "www.example.com",
+            "type": 5,
+            "class": 1,
+            "ttl": 300,
+            "rdlength": len(message),
+            "rdata": message,
+            "rdata_offset": 0
+        }
+
+        result = interpret_dns_record(record, message)
+
+        self.assertEqual(result["type"], "CNAME")
+        self.assertEqual(result["value"], "example.com")
+        self.assertEqual(result["ttl"], 300)
+
+    def test_cname_loop_detection(self):
+        cname_chain = {
+            "a.example.com",
+            "b.example.com"
+        }
+
+        result = resolve_test(
+            "a.example.com",
+            cname_chain=cname_chain
+        )
+
+        self.assertIsNone(result)
 
 if __name__ == "__main__":
     unittest.main()
