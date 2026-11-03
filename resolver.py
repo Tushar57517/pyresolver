@@ -148,6 +148,26 @@ def query_authoritative_server(domain, referrals):
     return None
 
 
+def resolve_nameserver_ip(nameserver, resolving_nameservers, depth):
+    """
+    Resolve a nameserver hostname when its glue A record is missing.
+    """
+
+    print(f"\nResolving nameserver hostname: {nameserver}")
+
+    answers = resolve_test(
+        nameserver.rstrip("."),
+        resolving_nameservers,
+        depth + 1
+    )
+
+    if not answers:
+        print("Could not resolve nameserver:", nameserver)
+        return None
+
+    return answers[0]["value"]
+
+
 def resolve_test(domain, resolving_nameservers=None, depth=0):
 
     if resolving_nameservers is None:
@@ -160,89 +180,113 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
         print("Circular nameserver lookup detected:", domain)
         return None
 
-    # Prevent excessive recursive lookups.
+    # Limit recursive nameserver lookups.
     if depth >= 10:
-        print("Maximum nameserver lookup depth reached.")
+        print("Maximum lookup depth reached.")
         return None
 
-    # Track the domain currently being resolved.
+    # Track domains currently being resolved.
     resolving_nameservers = set(resolving_nameservers)
     resolving_nameservers.add(domain_key)
 
-    current_server = "198.41.0.4"
+    # Start with the root server.
+    current_referrals = [
+        {
+            "nameserver": "root server",
+            "ip": "198.41.0.4"
+        }
+    ]
+
+    visited_servers = set()
 
     max_steps = 20
-    steps = 0
 
-    while steps < max_steps:
-        steps += 1
+    for step in range(1, max_steps + 1):
 
-        print(f"\nStep {steps}")
-        print("Querying server:", current_server)
-        print("Domain:", domain)
+        print(f"\nResolution step {step}")
 
-        try:
-            result = query_nameserver(domain, current_server)
+        next_referrals = None
 
-        except (ValueError, struct.error) as error:
-            print("DNS response error:", error)
-            return None
+        # Try nameservers from the current referral.
+        for referral in current_referrals:
 
-        if result is None:
-            print("No response from nameserver.")
-            return None
+            nameserver = referral["nameserver"]
+            nameserver_ip = referral["ip"]
 
-        # Check for the final A record.
-        if result["answers"]:
-            print("\nFinal A records:")
+            # Resolve missing glue only when needed.
+            if nameserver_ip is None:
 
-            for answer in result["answers"]:
-                print(answer["name"], "->", answer["value"])
+                nameserver_ip = resolve_nameserver_ip(
+                    nameserver,
+                    resolving_nameservers,
+                    depth
+                )
 
-            return result["answers"]
+                if nameserver_ip is None:
+                    continue
 
-        # Extract the next referral.
-        referrals = process_referral(
-            result["authority"],
-            result["additional"]
-        )
+            # Avoid querying the same IP repeatedly.
+            if nameserver_ip in visited_servers:
+                print("Already queried:", nameserver_ip)
+                continue
 
-        if not referrals:
-            print("No usable referral found.")
-            return None
+            visited_servers.add(nameserver_ip)
 
-        # For now, use the first referral.
-        next_referral = referrals[0]
+            print("\nQuerying nameserver:", nameserver)
+            print("Server IP:", nameserver_ip)
+            print("Domain:", domain)
 
-        nameserver = next_referral["nameserver"]
-        nameserver_ip = next_referral["ip"]
+            try:
+                result = query_nameserver(domain, nameserver_ip)
 
-        # If glue is missing, resolve the nameserver hostname.
-        if nameserver_ip is None:
+            except (ValueError, struct.error) as error:
+                print("DNS response error:", error)
+                continue
 
-            print("\nGlue record missing for:", nameserver)
-            print("Resolving nameserver hostname...")
+            # Try another nameserver if this one failed.
+            if result is None:
+                print("Nameserver failed. Trying next one.")
+                continue
 
-            nameserver_answers = resolve_test(
-                nameserver.rstrip("."),
-                resolving_nameservers,
-                depth + 1
+            # Final A record found.
+            if result["answers"]:
+
+                print("\nFinal A records:")
+
+                for answer in result["answers"]:
+                    print(answer["name"], "->", answer["value"])
+
+                return result["answers"]
+
+            # Extract the next referral.
+            referrals = process_referral(
+                result["authority"],
+                result["additional"]
             )
 
-            if not nameserver_answers:
-                print("Could not resolve nameserver hostname.")
-                return None
+            if referrals:
 
-            nameserver_ip = nameserver_answers[0]["value"]
+                print("\nNew referral received.")
 
-        # Use the nameserver IP for the next iteration.
-        current_server = nameserver_ip
+                # Move to the new delegation.
+                # Old referral candidates will be discarded.
+                next_referrals = referrals
 
-        print("\nFollowing referral:")
-        print("Nameserver:", nameserver)
-        print("IP address:", current_server)
+                break
 
-    print("Maximum resolution steps reached.")
+            print("No answer or referral from this nameserver.")
+            print("Trying another nameserver...")
+
+        # No usable nameserver or referral remains.
+        if not next_referrals:
+            print("\nNo more usable nameservers.")
+            print("Unable to resolve:", domain)
+            return None
+
+        # Continue with the new delegation.
+        current_referrals = next_referrals
+
+    print("\nMaximum resolution steps reached.")
     return None
 
 
