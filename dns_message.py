@@ -98,47 +98,79 @@ def decode_dns_flags(flags):
 # --------------------------------
 
 def decode_domain_name(message, offset):
-
     labels = []
-    original_offset = None
+    jumped = False
+    original_offset = offset
+
+    # Track offsets to detect compression pointer loops
+    visited_offsets = set()
 
     while True:
+        if offset >= len(message):
+            raise ValueError(
+                "DNS message is truncated while decoding domain name."
+            )
 
         length = message[offset]
 
-        if (length & 0xC0) == 0xC0:
+        # Check for compression pointer
+        if length & 0xC0 == 0xC0:
 
-            second_byte = message[offset + 1]
+            if offset + 2 > len(message):
+                raise ValueError(
+                    "DNS message is truncated: incomplete compression pointer."
+                )
 
-            pointer = ((length & 0x3F) << 8) | second_byte
+            pointer = struct.unpack(
+                "!H",
+                message[offset:offset + 2]
+            )[0] & 0x3FFF
 
-            if original_offset is None:
+            if pointer >= len(message):
+                raise ValueError(
+                    "Invalid DNS compression pointer: offset out of bounds."
+                )
+
+            # Detect compression pointer loops
+            if pointer in visited_offsets:
+                raise ValueError(
+                    "Invalid DNS compression pointer: circular reference detected."
+                )
+
+            visited_offsets.add(offset)
+
+            if not jumped:
                 original_offset = offset + 2
 
             offset = pointer
+            jumped = True
+            continue
 
-        elif length == 0:
-
-            if original_offset is None:
+        # End of domain name
+        if length == 0:
+            if not jumped:
                 original_offset = offset + 1
-
             break
 
-        else:
+        # Validate label length
+        if length & 0xC0:
+            raise ValueError("Invalid DNS label encoding.")
 
-            offset += 1
+        offset += 1
 
-            label = message[
-                offset:offset + length
-            ].decode("ascii")
+        if offset + length > len(message):
+            raise ValueError(
+                "DNS message is truncated: incomplete domain name label."
+            )
 
-            labels.append(label)
+        label = message[offset:offset + length].decode("ascii")
+        labels.append(label)
 
-            offset += length
+        offset += length
 
-    domain = ".".join(labels)
+    domain_name = ".".join(labels)
 
-    return domain, original_offset
+    return domain_name, original_offset
 
 
 # --------------------------------
@@ -169,23 +201,36 @@ def parse_dns_question(message, offset=12):
 
 def parse_dns_resource_record(message, offset):
 
+    if offset < 0 or offset >= len(message):
+        raise ValueError("Invalid resource record offset.")
+
     name, offset = decode_domain_name(message, offset)
+
+    # Validate the fixed 10-byte resource record header
+    if offset + 10 > len(message):
+        raise ValueError(
+            "DNS message is truncated: incomplete resource record header."
+        )
 
     record_type, record_class, ttl, rdlength = struct.unpack(
         "!HHIH",
         message[offset:offset + 10]
     )
 
-    offset += 10
+    # Calculate where RDATA begins
+    rdata_offset = offset + 10
 
-    # Remember where RDATA begins in the original message
-    rdata_offset = offset
-
-    # Extract RDATA
-    rdata = message[offset:offset + rdlength]
+    # Validate the RDATA length
+    if rdata_offset + rdlength > len(message):
+        raise ValueError(
+            "DNS message is truncated: incomplete resource record data."
+        )
 
     # Calculate the next record's position
-    next_offset = offset + rdlength
+    next_offset = rdata_offset + rdlength
+
+    # Extract RDATA
+    rdata = message[rdata_offset:next_offset]
 
     record = {
         "name": name,
