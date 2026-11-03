@@ -14,31 +14,31 @@ from network import send_dns_query
 
 
 def process_referral(authority_records, additional_records):
-
     referrals = []
 
-    # Examine every NS record
     for record in authority_records:
-
         if record["type"] != 2:
             continue
 
-        nameserver = record.get("nameserver")
+        nameserver = record["nameserver"]
 
-        if not nameserver:
-            continue
+        # Look for a matching A record in Additional.
+        nameserver_ip = None
 
-        # Find the corresponding A record
         for additional in additional_records:
+            if (
+                additional["type"] == "A"
+                and additional["name"].rstrip(".").lower()
+                == nameserver.rstrip(".").lower()
+            ):
+                nameserver_ip = additional["value"]
+                break
 
-            if additional["name"].rstrip(".").lower() == nameserver.rstrip(".").lower():
-
-                referral = {
-                    "nameserver": nameserver,
-                    "ip": additional["value"]
-                }
-
-                referrals.append(referral)
+        # Keep the referral even if its IP is missing.
+        referrals.append({
+            "nameserver": nameserver,
+            "ip": nameserver_ip
+        })
 
     return referrals
 
@@ -148,127 +148,102 @@ def query_authoritative_server(domain, referrals):
     return None
 
 
-def resolve_test(domain):
+def resolve_test(domain, resolving_nameservers=None, depth=0):
 
-    root_server = "198.41.0.4"
+    if resolving_nameservers is None:
+        resolving_nameservers = set()
 
-    # =================================
-    # STEP 1: QUERY ROOT SERVER
-    # =================================
+    domain_key = domain.rstrip(".").lower()
 
-    print("\n========== ROOT SERVER ==========")
+    # Prevent circular nameserver lookups.
+    if domain_key in resolving_nameservers:
+        print("Circular nameserver lookup detected:", domain)
+        return None
 
-    root_result = query_nameserver(domain, root_server)
+    # Prevent excessive recursive lookups.
+    if depth >= 10:
+        print("Maximum nameserver lookup depth reached.")
+        return None
 
-    if root_result is None:
-        print("Root query failed.")
-        return
+    # Track the domain currently being resolved.
+    resolving_nameservers = set(resolving_nameservers)
+    resolving_nameservers.add(domain_key)
 
-    # =================================
-    # STEP 2: FIND TLD NAMESERVERS
-    # =================================
+    current_server = "198.41.0.4"
 
-    tld_referrals = process_referral(
-        root_result["authority"],
-        root_result["additional"]
-    )
+    max_steps = 20
+    steps = 0
 
-    if not tld_referrals:
-        print("No usable TLD referrals found.")
-        return
+    while steps < max_steps:
+        steps += 1
 
-    print("\nDiscovered TLD nameservers:")
-
-    for referral in tld_referrals:
-        print(referral)
-
-    # =================================
-    # STEP 3: QUERY TLD SERVER
-    # =================================
-
-    print("\n========== TLD SERVER ==========")
-
-    tld_result = None
-
-    for referral in tld_referrals:
-
-        print(
-            f"\nTrying TLD server: "
-            f"{referral['nameserver']}"
-        )
+        print(f"\nStep {steps}")
+        print("Querying server:", current_server)
+        print("Domain:", domain)
 
         try:
-            tld_result = query_nameserver(
-                domain,
-                referral["ip"]
-            )
+            result = query_nameserver(domain, current_server)
+
         except (ValueError, struct.error) as error:
-            print("Invalid DNS response:", error)
-            continue
+            print("DNS response error:", error)
+            return None
 
-        if tld_result is not None:
-            break
+        if result is None:
+            print("No response from nameserver.")
+            return None
 
-    if tld_result is None:
-        print("All TLD nameservers failed.")
-        return
+        # Check for the final A record.
+        if result["answers"]:
+            print("\nFinal A records:")
 
-    # =================================
-    # STEP 4: CHECK FOR AN ANSWER
-    # =================================
+            for answer in result["answers"]:
+                print(answer["name"], "->", answer["value"])
 
-    if tld_result["answers"]:
+            return result["answers"]
 
-        print("\nDNS ANSWER FOUND AT TLD LEVEL")
-
-        for answer in tld_result["answers"]:
-            print(answer)
-
-        return
-
-    # =================================
-    # STEP 5: FIND AUTHORITATIVE SERVERS
-    # =================================
-
-    authoritative_referrals = process_referral(
-        tld_result["authority"],
-        tld_result["additional"]
-    )
-
-    if not authoritative_referrals:
-        print("No usable authoritative referrals found.")
-        return
-
-    print("\nDiscovered authoritative nameservers:")
-
-    for referral in authoritative_referrals:
-        print(referral)
-
-    # =================================
-    # STEP 6: QUERY AUTHORITATIVE SERVER
-    # =================================
-
-    print("\n========== AUTHORITATIVE SERVER ==========")
-
-    authoritative_result = query_authoritative_server(
-        domain,
-        authoritative_referrals
-    )
-
-    if authoritative_result is None:
-        return
-
-    # =================================
-    # STEP 7: DISPLAY FINAL A RECORDS
-    # =================================
-
-    print("\n========== FINAL DNS RESULT ==========")
-
-    for answer in authoritative_result["answers"]:
-        print(
-            f"{answer['name']} -> {answer['value']} "
-            f"(TTL: {answer['ttl']})"
+        # Extract the next referral.
+        referrals = process_referral(
+            result["authority"],
+            result["additional"]
         )
+
+        if not referrals:
+            print("No usable referral found.")
+            return None
+
+        # For now, use the first referral.
+        next_referral = referrals[0]
+
+        nameserver = next_referral["nameserver"]
+        nameserver_ip = next_referral["ip"]
+
+        # If glue is missing, resolve the nameserver hostname.
+        if nameserver_ip is None:
+
+            print("\nGlue record missing for:", nameserver)
+            print("Resolving nameserver hostname...")
+
+            nameserver_answers = resolve_test(
+                nameserver.rstrip("."),
+                resolving_nameservers,
+                depth + 1
+            )
+
+            if not nameserver_answers:
+                print("Could not resolve nameserver hostname.")
+                return None
+
+            nameserver_ip = nameserver_answers[0]["value"]
+
+        # Use the nameserver IP for the next iteration.
+        current_server = nameserver_ip
+
+        print("\nFollowing referral:")
+        print("Nameserver:", nameserver)
+        print("IP address:", current_server)
+
+    print("Maximum resolution steps reached.")
+    return None
 
 
 if __name__ == "__main__":
