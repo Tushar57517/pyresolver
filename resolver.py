@@ -1,5 +1,7 @@
 import struct
 import argparse
+import secrets
+
 from dns_message import (
     build_dns_query,
     parse_dns_header,
@@ -7,11 +9,16 @@ from dns_message import (
     parse_dns_question,
     parse_answer_section,
     parse_authority_section,
-    parse_additional_section
+    parse_additional_section,
+    validate_dns_response
 )
 
 from network import send_dns_query
 
+
+# --------------------------------------------------
+# 1. Process DNS referrals
+# --------------------------------------------------
 
 def process_referral(authority_records, additional_records):
     referrals = []
@@ -21,10 +28,9 @@ def process_referral(authority_records, additional_records):
             continue
 
         nameserver = record["nameserver"]
-
-        # Look for a matching A record in Additional.
         nameserver_ip = None
 
+        # Find the matching glue A record.
         for additional in additional_records:
             if (
                 additional["type"] == "A"
@@ -34,7 +40,6 @@ def process_referral(authority_records, additional_records):
                 nameserver_ip = additional["value"]
                 break
 
-        # Keep the referral even if its IP is missing.
         referrals.append({
             "nameserver": nameserver,
             "ip": nameserver_ip
@@ -42,38 +47,45 @@ def process_referral(authority_records, additional_records):
 
     return referrals
 
-def parse_dns_response(response):
 
-    # Parse header
-    header = parse_dns_header(response)
+# --------------------------------------------------
+# 2. Parse and validate DNS responses
+# --------------------------------------------------
 
-    # Decode flags
-    flags = decode_dns_flags(header["flags"])
+def parse_dns_response(
+    response,
+    expected_transaction_id,
+    expected_domain
+):
+    # Validate header, transaction ID, QR and question.
+    validation_result = validate_dns_response(
+        response,
+        expected_transaction_id,
+        expected_domain
+    )
 
-    if flags["QR"] != 1:
-        raise ValueError("Received a DNS query, not a response")
+    # Support either a three-value or four-value
+    # validation function return.
+    header, flags, question = validation_result[:3]
 
-    if flags["RCODE"] != 0:
-        raise ValueError(f"DNS error: {flags['RCODE']}")
+    # Get the offset immediately after the question.
+    _, offset = parse_dns_question(response)
 
-    # Parse question
-    question, offset = parse_dns_question(response)
-
-    # Parse answer section
+    # Parse Answer section.
     answers, offset = parse_answer_section(
         response,
         offset,
         header["ancount"]
     )
 
-    # Parse authority section
+    # Parse Authority section.
     authority, offset = parse_authority_section(
         response,
         offset,
         header["nscount"]
     )
 
-    # Parse additional section
+    # Parse Additional section.
     additional, offset = parse_additional_section(
         response,
         offset,
@@ -89,69 +101,79 @@ def parse_dns_response(response):
         "additional": additional
     }
 
+
+# --------------------------------------------------
+# 3. Handle DNS response codes
+# --------------------------------------------------
+
+def handle_dns_error(result):
+
+    rcode = result["flags"]["RCODE"]
+
+    error_messages = {
+        1: "FORMERR - Format error",
+        2: "SERVFAIL - Server failure",
+        3: "NXDOMAIN - Domain does not exist",
+        4: "NOTIMP - Not implemented",
+        5: "REFUSED - Query refused"
+    }
+
+    if rcode == 0:
+        return "SUCCESS"
+
+    message = error_messages.get(
+        rcode,
+        f"Unknown DNS error: {rcode}"
+    )
+
+    print(message)
+
+    if rcode == 3:
+        return "NXDOMAIN"
+
+    return "RETRY"
+
+
+# --------------------------------------------------
+# 4. Query a nameserver
+# --------------------------------------------------
+
 def query_nameserver(domain, server_ip):
 
+    # Generate a random 16-bit transaction ID.
+    transaction_id = secrets.randbelow(65536)
+
     print(f"\nQuerying {server_ip} for {domain}")
+    print("Transaction ID:", transaction_id)
 
-    # Build the original A-record query
-    query = build_dns_query(domain)
+    # Build query using this transaction ID.
+    query = build_dns_query(domain, transaction_id)
 
-    # Send it to the selected nameserver
+    # Send query.
     response = send_dns_query(query, server_ip)
 
     if response is None:
         return None
 
-    # Parse the DNS response
-    result = parse_dns_response(response)
+    # Validate and parse response.
+    result = parse_dns_response(
+        response,
+        transaction_id,
+        domain
+    )
 
     return result
 
 
-def query_authoritative_server(domain, referrals):
+# --------------------------------------------------
+# 5. Resolve nameserver hostname when glue is missing
+# --------------------------------------------------
 
-    for referral in referrals:
-
-        nameserver = referral["nameserver"]
-        server_ip = referral["ip"]
-
-        print(
-            f"\nTrying authoritative server: "
-            f"{nameserver} ({server_ip})"
-        )
-
-        try:
-            result = query_nameserver(domain, server_ip)
-
-        except (ValueError, struct.error) as error:
-            print("Invalid DNS response:", error)
-            continue
-
-        if result is None:
-            continue
-
-        # Check whether we received an A record
-        if result["answers"]:
-
-            print("\nAUTHORITATIVE ANSWERS")
-
-            for answer in result["answers"]:
-                print(answer)
-
-            return result
-
-        # The server may have returned another referral
-        print("No A answer from this nameserver.")
-
-    print("\nNo usable authoritative answer found.")
-
-    return None
-
-
-def resolve_nameserver_ip(nameserver, resolving_nameservers, depth):
-    """
-    Resolve a nameserver hostname when its glue A record is missing.
-    """
+def resolve_nameserver_ip(
+    nameserver,
+    resolving_nameservers,
+    depth
+):
 
     print(f"\nResolving nameserver hostname: {nameserver}")
 
@@ -167,6 +189,10 @@ def resolve_nameserver_ip(nameserver, resolving_nameservers, depth):
 
     return answers[0]["value"]
 
+
+# --------------------------------------------------
+# 6. Main iterative resolution function
+# --------------------------------------------------
 
 def resolve_test(domain, resolving_nameservers=None, depth=0):
 
@@ -198,7 +224,6 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
     ]
 
     visited_servers = set()
-
     max_steps = 20
 
     for step in range(1, max_steps + 1):
@@ -237,7 +262,10 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
             print("Domain:", domain)
 
             try:
-                result = query_nameserver(domain, nameserver_ip)
+                result = query_nameserver(
+                    domain,
+                    nameserver_ip
+                )
 
             except (ValueError, struct.error) as error:
                 print("DNS response error:", error)
@@ -248,13 +276,29 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
                 print("Nameserver failed. Trying next one.")
                 continue
 
+            # Handle DNS response codes.
+            status = handle_dns_error(result)
+
+            if status == "NXDOMAIN":
+                print("Domain does not exist.")
+                return None
+
+            if status == "RETRY":
+                print("Nameserver returned an error.")
+                print("Trying next nameserver.")
+                continue
+
             # Final A record found.
             if result["answers"]:
 
                 print("\nFinal A records:")
 
                 for answer in result["answers"]:
-                    print(answer["name"], "->", answer["value"])
+                    print(
+                        answer["name"],
+                        "->",
+                        answer["value"]
+                    )
 
                 return result["answers"]
 
@@ -268,10 +312,8 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
 
                 print("\nNew referral received.")
 
-                # Move to the new delegation.
-                # Old referral candidates will be discarded.
+                # Discard old referral candidates.
                 next_referrals = referrals
-
                 break
 
             print("No answer or referral from this nameserver.")
@@ -279,8 +321,10 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
 
         # No usable nameserver or referral remains.
         if not next_referrals:
+
             print("\nNo more usable nameservers.")
             print("Unable to resolve:", domain)
+
             return None
 
         # Continue with the new delegation.
@@ -290,7 +334,12 @@ def resolve_test(domain, resolving_nameservers=None, depth=0):
     return None
 
 
+# --------------------------------------------------
+# 7. Command-line interface
+# --------------------------------------------------
+
 if __name__ == "__main__":
+
     parser = argparse.ArgumentParser(
         description="DNS Resolver Test CLI"
     )
@@ -298,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "domain",
         type=str,
-        help="Domain name to resolve (required)",
+        help="Domain name to resolve (required)"
     )
 
     args = parser.parse_args()

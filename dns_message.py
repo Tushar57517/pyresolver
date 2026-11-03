@@ -7,9 +7,8 @@ import socket
 # DNS QUERY CONSTRUCTION
 # --------------------------------
 
-def build_dns_header():
-    transaction_id = 1234
-    flags = 0x0000
+def build_dns_header(transaction_id = 1234):
+    flags = 0x0000  # RD = 0
 
     qdcount = 1
     ancount = 0
@@ -53,8 +52,8 @@ def build_dns_question(domain):
     return qname + question_fields
 
 
-def build_dns_query(domain):
-    header = build_dns_header()
+def build_dns_query(domain,transaction_id=1234):
+    header = build_dns_header(transaction_id)
     question = build_dns_question(domain)
 
     return header + question
@@ -308,3 +307,44 @@ def parse_additional_section(message, offset, arcount):
             additional_records.append(result)
 
     return additional_records, offset
+
+def validate_dns_response(
+    response,
+    expected_transaction_id,
+    expected_domain
+):
+    # A DNS header must contain at least 12 bytes.
+    if len(response) < 12:
+        raise ValueError("DNS response is shorter than the header.")
+
+    header = parse_dns_header(response)
+    flags = decode_dns_flags(header["flags"])
+
+    # Validate Transaction ID.
+    if header["transaction_id"] != expected_transaction_id:
+        raise ValueError("DNS Transaction ID mismatch.")
+
+    # Ensure this packet is a response.
+    if flags["QR"] != 1:
+        raise ValueError("Received packet is not a DNS response.")
+
+    # We currently support exactly one question.
+    if header["qdcount"] != 1:
+        raise ValueError("Unexpected DNS question count.")
+
+    # Parse and validate the question.
+    question, _ = parse_dns_question(response)
+
+    received_domain = question["domain"].rstrip(".").lower()
+    expected_domain = expected_domain.rstrip(".").lower()
+
+    if received_domain != expected_domain:
+        raise ValueError("DNS question name mismatch.")
+
+    if question["qtype"] != 1:
+        raise ValueError("Unexpected DNS query type.")
+
+    if question["qclass"] != 1:
+        raise ValueError("Unexpected DNS query class.")
+
+    return header, flags, question
