@@ -14,7 +14,7 @@ from dns_message import (
     validate_dns_response
 )
 
-from network import send_dns_query
+from network import send_dns_query, send_dns_query_tcp
 
 dns_cache = {}
 
@@ -207,6 +207,20 @@ def query_nameserver(domain, server_ip):
     if response is None:
         return None
 
+    # Check whether the UDP response is truncated.
+    header = parse_dns_header(response)
+    flags = decode_dns_flags(header["flags"])
+
+    if flags["TC"] == 1:
+        print("Truncated DNS response received.")
+        print("Retrying query using TCP...")
+
+        response = send_dns_query_tcp(query, server_ip)
+
+        if response is None:
+            print("TCP fallback failed.")
+            return None
+
     # Validate and parse response.
     result = parse_dns_response(
         response,
@@ -380,7 +394,7 @@ def resolve_test(domain, resolving_nameservers=None, depth=0, cname_chain=None):
 
                  # Store successful A records in the DNS cache.
                 store_in_cache(domain_key, a_records)
-                
+
                 return a_records
 
             # Check for CNAME records.
