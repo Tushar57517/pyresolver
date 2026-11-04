@@ -1,6 +1,7 @@
 import struct
 import argparse
 import secrets
+import time
 
 from dns_message import (
     build_dns_query,
@@ -15,6 +16,57 @@ from dns_message import (
 
 from network import send_dns_query
 
+dns_cache = {}
+
+def store_in_cache(domain, records):
+    domain_key = domain.rstrip(".").lower()
+
+    for record in records:
+        ttl = record["ttl"]
+
+        if ttl <= 0:
+            continue
+
+        expires_at = time.time() + ttl
+
+        cached_record = {
+            "type": "A",
+            "value": record["value"],
+            "ttl": ttl,
+            "expires_at": expires_at
+        }
+
+        dns_cache.setdefault(domain_key, []).append(cached_record)
+
+def get_from_cache(domain):
+    domain_key = domain.rstrip(".").lower()
+
+    if domain_key not in dns_cache:
+        return None
+
+    current_time = time.time()
+
+    valid_records = [
+        record
+        for record in dns_cache[domain_key]
+        if record["expires_at"] > current_time
+    ]
+
+    if not valid_records:
+        del dns_cache[domain_key]
+        return None
+
+    dns_cache[domain_key] = valid_records
+
+    return [
+        {
+            "name": domain_key,
+            "type": "A",
+            "value": record["value"],
+            "ttl": max(0, int(record["expires_at"] - current_time))
+        }
+        for record in valid_records
+    ]
 
 # --------------------------------------------------
 # 1. Process DNS referrals
@@ -204,6 +256,14 @@ def resolve_test(domain, resolving_nameservers=None, depth=0, cname_chain=None):
 
     domain_key = domain.rstrip(".").lower()
 
+    cached_records = get_from_cache(domain_key)
+
+    if cached_records is not None:
+        print(f"\nCache hit for {domain}")
+        return cached_records
+
+    print(f"\nCache miss for {domain}")
+
     # Prevent circular nameserver lookups.
     if domain_key in resolving_nameservers:
         print("Circular nameserver lookup detected:", domain)
@@ -318,6 +378,9 @@ def resolve_test(domain, resolving_nameservers=None, depth=0, cname_chain=None):
                         answer["value"]
                     )
 
+                 # Store successful A records in the DNS cache.
+                store_in_cache(domain_key, a_records)
+                
                 return a_records
 
             # Check for CNAME records.
