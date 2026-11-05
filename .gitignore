@@ -134,4 +134,5 @@ cython_debug/
 .env.*.local
 
 benchmarks/results/*.txt
+benchmarks/results/*.csv
 !benchmarks/results/.gitkeep
